@@ -443,29 +443,101 @@ function analyze(text, durSec, audio, taps=0){
     mlr: audio && n ? round(n/(audio.pauses+1),1) : null,
     latency: audio && audio.firstVoiceMs!=null ? round(audio.firstVoiceMs/1000,1) : null
   };
+  m.d = discourseSignals(text);
+  m.restarts = countPhrases(text, RESTARTS).count; m.restartPm = round(m.restarts/mins,1);
   m.sub = subScores(m);
   return m;
 }
+/* ---- Coherence & concision signals (transcript-only, punctuation-free) ---- */
+const RESTARTS = ['i mean','sorry','wait','let me rephrase','what i\'m trying to say','what im trying to say','or rather','anyway','i don\'t know','i dont know','if that makes sense','does that make sense','you know what i mean','how do i put this','where was i','or whatever','or something','and stuff','and everything','so yeah','yeah so'];
+const CHAINERS = /\b(and|so|then|but|like|because)\b/g;
+const STANCE = ['i think','i believe','i\'d say','id say','i would say','my view','in my view','the answer is','the short answer','the key','the main','yes','no','definitely','absolutely','i agree','i disagree','it\'s better','its better','is better','should','the best','the point is','overall','basically the answer'];
+const UNSURE = ['i don\'t know','i dont know','not sure','i guess','i suppose','who knows','hard to say','it depends'];
+function repeatedTrigramRatio(w){
+  const c = w.filter(x=>!STOP.has(x)); if(c.length<9) return 0;
+  const seen = new Map(); let rep=0, tot=0;
+  for(let i=0;i+3<=c.length;i++){ const t=c[i]+' '+c[i+1]+' '+c[i+2]; tot++; if(seen.has(t)) rep++; seen.set(t,1); }
+  const bi = new Map(); let brep=0, btot=0;
+  for(let i=0;i+2<=c.length;i++){ const t=c[i]+' '+c[i+1]; btot++; bi.set(t,(bi.get(t)||0)+1); }
+  for(const v of bi.values()) if(v>1) brep+=v-1;
+  return Math.max(tot?rep/tot:0, btot?brep/btot*0.8:0);
+}
+function discourseSignals(text){
+  const w = words(text), n = Math.max(1,w.length), nt = norm(text);
+  const chains = (nt.match(CHAINERS)||[]).length;
+  const restarts = countPhrases(text, RESTARTS).count;
+  const unsure = countPhrases(text, UNSURE).count;
+  const signposts = countPhrases(text, MARKERS).count;
+  const content = w.filter(x=>!STOP.has(x) && x.length>2).length;
+  const first = w.slice(0,30).join(' ');
+  return {
+    chainRate: round(chains/n*100,1), restartRate: round(restarts/n*100,1), unsureRate: round(unsure/n*100,1),
+    signpostRate: round(signposts/n*100,1), density: round(content/n,2), repeat: round(repeatedTrigramRatio(w),2),
+    pointFirst: countPhrases(first, STANCE).count>0
+  };
+}
+function heuristicClarity(d, n){
+  if(n<20) return 20;
+  let s = 60;
+  s -= Math.max(0, d.chainRate-5)*5;
+  s -= d.restartRate*9;
+  s -= d.unsureRate*8;
+  s -= d.repeat*140;
+  s -= Math.max(0, 0.42-d.density)*220;
+  s += Math.min(12, d.signpostRate*5);
+  s += d.pointFirst ? 6 : -8;
+  return clamp(s);
+}
+function heuristicConcision(d, n, sec){
+  if(n<20) return 20;
+  let s = 72;
+  s -= d.repeat*170;
+  s -= Math.max(0, d.chainRate-5)*5;
+  s -= d.restartRate*8;
+  s -= Math.max(0, 0.42-d.density)*200;
+  if(!d.pointFirst) s -= 8;
+  return clamp(s);
+}
 function subScores(m){
   const s = {};
-  s.filler = clamp(100 - m.fpm*8.3);
-  s.pause = m.lppm==null ? null : clamp(100 - m.lppm*18);
-  s.mlr = m.mlr==null ? null : clamp((m.mlr-3)/(14-3)*100);
+  const disfl = m.fpm + (m.restartPm||0)*0.7;
+  s.filler = clamp(100 - disfl*9);
+  s.pause = m.lppm==null ? null : clamp(100 - m.lppm*20);
+  s.mlr = m.mlr==null ? null : clamp((m.mlr-4)/(14-4)*100);
   s.latency = m.latency==null ? null : clamp(100 - (m.latency-0.8)*20);
-  s.rate = m.wpm===0 ? 0 : (m.wpm>=130 && m.wpm<=170 ? 100 : clamp(100 - Math.abs(m.wpm-(m.wpm<130?130:170))*1.6));
-  s.lexical = m.mattr==null ? null : clamp((m.mattr-0.55)/(0.82-0.55)*100);
-  s.vague = clamp(100 - m.vagueRate*11);
-  s.hedge = clamp(100 - m.hedgeRate*14);
+  s.rate = m.wpm===0 ? 0 : (m.wpm>=130 && m.wpm<=170 ? 100 : clamp(100 - Math.abs(m.wpm-(m.wpm<130?130:170))*1.8));
+  s.lexical = (m.mattr==null || m.words<50) ? null : clamp((m.mattr-0.66)/(0.84-0.66)*100);
+  s.density = clamp((m.d.density-0.30)/(0.52-0.30)*100);
+  s.vague = clamp(100 - m.vagueRate*12);
+  s.hedge = clamp(100 - m.hedgeRate*15);
   s.fluency = avg([s.filler, s.filler, s.pause, s.mlr, s.latency]);
+  s.clarityH = heuristicClarity(m.d, m.words);
+  s.concisionH = heuristicConcision(m.d, m.words, m.sec);
   return s;
 }
+const COACH_KEYS = ['structure','clarity','coherence','precision','concision','impact'];
+function pillarsOf(m, coach){
+  const s = m.sub, cs = coach && coach.scores ? coach.scores : null;
+  const num = k => cs && cs[k]!=null && !isNaN(Number(cs[k])) ? Number(cs[k])*10 : null;
+  const judged = !!(cs && num('clarity')!=null);
+  // Without the coach, content quality can't be verified, so estimates are capped at 65.
+  const clarity = judged ? avg([num('clarity'), num('coherence') ?? num('clarity'), num('structure')]) : Math.min(65, s.clarityH);
+  const concision = judged ? (num('concision') ?? s.concisionH) : Math.min(65, s.concisionH);
+  const fluency = s.fluency;
+  const language = avg([s.vague, s.density, s.lexical, num('precision')]);
+  const delivery = avg([s.rate, s.hedge, s.pause]);
+  return {clarity:Math.round(clarity), concision:Math.round(concision), fluency:Math.round(fluency??50), language:Math.round(language??50), delivery:Math.round(delivery??50), judged};
+}
+const PILLAR_W = {clarity:0.45, concision:0.20, fluency:0.15, language:0.12, delivery:0.08};
+const PILLAR_NAMES = {clarity:'Clarity and structure', concision:'Concision', fluency:'Fluency', language:'Word choice', delivery:'Delivery'};
 function computeIndex(m, coach){
-  const s = m.sub; const parts = [];
-  parts.push([s.fluency, 0.30]); parts.push([s.rate, 0.10]); parts.push([avg([s.lexical, s.vague]), 0.20]); parts.push([s.hedge, 0.10]);
-  if(coach && coach.scores){ const c = avg(['structure','clarity','precision','concision','impact'].map(k=>Number(coach.scores[k]))); if(c!=null) parts.push([c*10, 0.30]); }
-  let sum=0, wt=0; for(const [v,wgt] of parts){ if(v!=null){ sum+=v*wgt; wt+=wgt; } }
-  if(m.words<12) return Math.round((wt?sum/wt:0)*0.5);
-  return Math.round(wt ? sum/wt : 0);
+  const p = pillarsOf(m, coach); m.pillars = p;
+  let sum=0; for(const k in PILLAR_W) sum += p[k]*PILLAR_W[k];
+  // Gate: a confused or rambling answer can't be rescued by smooth delivery.
+  const gate = Math.min(p.clarity, p.concision) + 18;
+  let idx = Math.min(sum, gate);
+  if(m.words<20) idx *= 0.5;
+  return Math.round(clamp(idx));
 }
 
 /* ================= SPEECH CAPTURE (Web Speech API + Web Audio) ================= */
@@ -541,8 +613,8 @@ function applyObservations(m, coach, text){
   updateSkill('fluency', s.fluency); updateSkill('retrieval', s.lexical);
   updateSkill('precision', avg([s.vague, coach?.scores?.precision*10]));
   updateSkill('delivery', avg([s.rate, s.pause])); updateSkill('composure', s.hedge);
-  if(coach?.scores){ updateSkill('structure', coach.scores.structure*10); updateSkill('concision', coach.scores.concision*10); }
-  else if(text){ updateSkill('structure', structureHeuristic(text)); }
+  if(coach?.scores){ updateSkill('structure', avg([coach.scores.structure*10, coach.scores.coherence!=null?coach.scores.coherence*10:null])); updateSkill('concision', coach.scores.concision*10); }
+  else { updateSkill('concision', m.sub.concisionH); if(text) updateSkill('structure', avg([structureHeuristic(text), m.sub.clarityH])); }
 }
 function staircase(key, success, fail){ const l=lvl(key); if(success) S.levels[key]=Math.min(10,l+1); else if(fail) S.levels[key]=Math.max(1,l-1); }
 
@@ -659,20 +731,30 @@ async function coachFeedback(d, transcript, m){
 ${coachContext()}
 Drill: ${drillBrief(d)}
 Prompt they spoke to: "${d.topic}"
+Discourse signals: 'and/so/then/but/like' chaining ${m.d?m.d.chainRate:'?'} per 100 words (clear speakers ~3-5), repeated-phrase ratio ${m.d?m.d.repeat:'?'}, restarts ${m.restarts||0}, content-word density ${m.d?m.d.density:'?'}.
 Measured by the app: ${m.words} words in ${m.sec}s, ${m.wpm} words/min, ${m.fpm} fillers/min, vague-word rate ${m.vagueRate}%, hedge rate ${m.hedgeRate}%, lexical diversity (MATTR) ${m.mattr}${m.lppm!=null?`, long pauses ${m.lppm}/min, mean length of run ${m.mlr} words`:''}.
 
 Transcript (automatic speech recognition: no punctuation, may contain recognition errors, and sounds like "um" are often dropped, so do not criticise punctuation or obvious mis-hearings):
 """${transcript.slice(0,4000)}"""
 
-Reply with only a JSON object, no other text:
-{"scores":{"structure":1-10,"clarity":1-10,"precision":1-10,"concision":1-10,"impact":1-10},
+SCORING RUBRIC (be strict and calibrated; do not reward length, confidence of tone, or effort):
+- structure: 1-3 no discernible order or point; 4-5 a point emerges late or is buried; 6-7 clear point, mostly logical order; 8-9 point first, signposted, tight; 10 exceptional.
+- clarity: could a listener repeat the main point after ONE hearing? 1-3 no; 4-5 only vaguely; 6-7 yes; 8-10 instantly and precisely.
+- coherence: does each sentence follow from the last, without contradiction, circling back, or losing the thread? Contradicting yourself or saying "it depends" without resolving it caps this at 4.
+- concision: words spent vs. words needed. Repetition, restating, tangents, false starts or a slow wind-up cap this at 4. Saying the same idea 3+ times caps it at 3.
+- precision: specific nouns, numbers, examples vs. vague words (thing, stuff, a lot, good).
+- impact: would this persuade or stick with a listener?
+Calibration: an untrained adult averages 4-5. Scores of 7+ are rare and must be earned. Long-winded or confused speech MUST get concision <=4 and coherence <=4, however fluent it sounds. If you cannot state their main point in one sentence, clarity and structure must be <=4.
+
+First, silently identify their main point. Then reply with only a JSON object, no other text:
+{"main_point":"their main point in one sentence, or an empty string if none can be identified","scores":{"structure":1-10,"clarity":1-10,"coherence":1-10,"precision":1-10,"concision":1-10,"impact":1-10},
 "headline":"one sentence verdict, specific to this speech",
 "strengths":["1-2 specific things done well"],
 "fixes":[{"issue":"short name","you_said":"a short exact quote from the transcript","try":"a sharper way to say it"}],
 "rewrite":"the same ideas said articulately in the speaker's own voice, spoken register, no longer than their version, max 90 words",
 "power_words":[{"word":"a precise word or phrase that would have upgraded this speech","meaning":"plain definition","example":"example sentence"}],
 "next_rep":"one concrete instruction for the next attempt"}
-Give 2-3 fixes and 2-3 power_words. Be calibrated: 5 is average adult, 8+ is genuinely polished.`;
+Give 2-3 fixes (prioritise the biggest clarity or concision problem first) and 2-3 power_words. The headline must name their single biggest problem honestly.`;
   return await askJSON(prompt);
 }
 async function coachProfile(tA, tC, mA, mC, sprintCount){
@@ -682,23 +764,33 @@ async function coachProfile(tA, tC, mA, mC, sprintCount){
 
 ${coachContext()}
 
-Task 1, impromptu opinion (prep 20s, 60s): measured ${mA.wpm} wpm, ${mA.fpm} fillers/min, vague rate ${mA.vagueRate}%, hedge rate ${mA.hedgeRate}%, MATTR ${mA.mattr}.
+Task 1, impromptu opinion (prep 20s, 60s): measured ${mA.wpm} wpm, ${mA.fpm} fillers/min, vague rate ${mA.vagueRate}%, hedge rate ${mA.hedgeRate}%, chaining ${mA.d.chainRate}/100 words, repeated-phrase ratio ${mA.d.repeat}, restarts ${mA.restarts}.
 Transcript: """${tA.slice(0,2500)}"""
 
 Task 2, verbal fluency sprint: produced ${sprintCount} distinct content words in 45 seconds.
 
-Task 3, explain something they know to a 12-year-old (60s): measured ${mC.wpm} wpm, ${mC.fpm} fillers/min, vague rate ${mC.vagueRate}%, MATTR ${mC.mattr}.
+Task 3, explain something they know to a 12-year-old (60s): measured ${mC.wpm} wpm, ${mC.fpm} fillers/min, vague rate ${mC.vagueRate}%, chaining ${mC.d.chainRate}/100 words, repeated-phrase ratio ${mC.d.repeat}, restarts ${mC.restarts}.
 Transcript: """${tC.slice(0,2500)}"""
 
 Transcripts come from speech recognition: no punctuation, possible mis-hearings, "um"s often dropped.
 
+SCORING RUBRIC (be strict and calibrated; do not reward length, confidence of tone, or effort):
+- structure: 1-3 no discernible order or point; 4-5 a point emerges late or is buried; 6-7 clear point, mostly logical order; 8-9 point first, signposted, tight; 10 exceptional.
+- clarity: could a listener repeat the main point after ONE hearing? 1-3 no; 4-5 only vaguely; 6-7 yes; 8-10 instantly and precisely.
+- coherence: does each sentence follow from the last, without contradiction, circling back, or losing the thread? Contradicting yourself or saying "it depends" without resolving it caps this at 4.
+- concision: words spent vs. words needed. Repetition, restating, tangents, false starts or a slow wind-up cap this at 4. Saying the same idea 3+ times caps it at 3.
+- precision: specific nouns, numbers, examples vs. vague words (thing, stuff, a lot, good).
+- impact: would this persuade or stick with a listener?
+Calibration: an untrained adult averages 4-5. Scores of 7+ are rare and must be earned. Long-winded or confused speech MUST get concision <=4 and coherence <=4, however fluent it sounds. If you cannot state their main point in one sentence, clarity and structure must be <=4.
+Score across both speaking tasks, weighting the weaker one more.
+
 Reply with only a JSON object:
-{"scores":{"structure":1-10,"clarity":1-10,"precision":1-10,"concision":1-10,"impact":1-10},
+{"main_point_task1":"their main point in task 1 in one sentence, or empty if none","scores":{"structure":1-10,"clarity":1-10,"coherence":1-10,"precision":1-10,"concision":1-10,"impact":1-10},
 "summary":"2-3 sentences describing their current speaking profile, specific and honest but encouraging",
 "strengths":["2 specific strengths"],
 "priorities":[{"skill":"one of fluency|retrieval|structure|precision|concision|delivery|composure","why":"one sentence citing evidence from their speech"}],
 "first_week_focus":"one sentence"}
-Give exactly 3 priorities, most important first. Calibrate: 5 is average adult.`;
+Give exactly 3 priorities, most important first. The summary must be honest: if they rambled or were hard to follow, say so plainly and kindly.`;
   return await askJSON(prompt);
 }
 function coachErrText(e){
@@ -780,8 +872,10 @@ function vReport(){
   const b = S.baseline; const c = b.coach;
   const pr = c && c.priorities ? c.priorities : Object.entries(S.skills).sort((a,b)=>a[1]-b[1]).slice(0,3).map(([k])=>({skill:k, why:SKILLS[k].desc}));
   return Wrap(`<div class="stack">${hdr('Your starting point')}
-    <div class="card hero stack center"><p class="muted">Articulacy index</p><div class="bignum">${b.index}</div><p class="small muted">Out of 100, combining fluency, pace, word choice, confidence and (when the coach is available) structure and clarity. It is your personal starting line: what matters is how it moves at each 7-day checkpoint.</p></div>
+    <div class="card hero stack center"><p class="muted">Articulacy index</p><div class="bignum">${b.index}</div><p class="small muted">Out of 100. Clarity and concision make up 65% of it. The scale is calibrated so untrained speakers usually land between 35 and 55. What matters is how it moves at each 7-day checkpoint.</p></div>
     ${c&&c.summary?`<div class="card stack"><h3>Coach\u2019s read</h3><p>${esc(c.summary)}</p>${c.strengths?`<p class="small muted"><b>Strengths:</b> ${c.strengths.map(esc).join(' ')}</p>`:''}</div>`:''}
+    ${b.pillars?`<div class="card stack"><h3>Score breakdown</h3>${pillarBars(b.pillars)}</div>`:''}
+    ${c&&c.main_point_task1!==undefined?`<div class="card flat stack small"><b>Your main point in task 1, as a listener heard it</b><p>${c.main_point_task1?esc(c.main_point_task1):'<span style="color:var(--bad)">No clear main point could be identified.</span>'}</p></div>`:''}
     <h3>What Lucid measured</h3>
     ${metricTiles(b.mA)}
     <div class="card stack"><h3>Your top priorities</h3>${pr.slice(0,3).map((p,i)=>`<div><b>${i+1}. ${esc(SKILLS[p.skill]?.name||p.skill)}</b><p class="small muted">${esc(p.why)}</p></div>`).join('')}</div>
@@ -789,6 +883,12 @@ function vReport(){
     <div class="card flat stack"><h3>Your regimen</h3><p class="small">Six weeks, one phase per week, 7 days each, with a checkpoint every 7th session. Every drill adapts: hit your target and it gets harder (less prep, tougher topics, stricter filler limits); miss it and it eases off. Your weakest skill gets an extra drill every day.</p><p class="small muted">Your week 1 filler target: ${fillerTarget(1)} per minute or fewer.</p></div>
     <button class="btn block" data-a="go" data-v="today">Start day 1</button>
   </div>`);
+}
+function pillarBars(p){
+  if(!p) return '';
+  const col=v=>v>=70?'var(--good)':v>=45?'var(--accent)':'var(--bad)';
+  return `<div class="stack" style="gap:10px">${Object.keys(PILLAR_W).map(k=>`<div class="stack" style="gap:4px"><div class="row between small"><b>${PILLAR_NAMES[k]}${(k==='clarity'||k==='concision')&&!p.judged?' <span class="pill sig">estimated</span>':''}</b><span class="muted">${Math.round(PILLAR_W[k]*100)}% weight <b style="color:var(--ink)">${p[k]}</b></span></div><div class="bar"><i style="width:${p[k]}%;background:${col(p[k])}"></i></div></div>`).join('')}
+  <p class="tiny muted">${p.judged?'Clarity and concision were judged by the AI coach against a strict rubric.':'Without the AI coach, clarity and concision are estimated from how your sentences chain, repeat and restart, and are capped at 65. Add the coach for a true judgment.'} Your overall score can\u2019t exceed your weaker of clarity and concision by more than 18 points, so smooth delivery can\u2019t hide a muddled message.</p></div>`;
 }
 function skillBars(){
   return Object.keys(SKILLS).map(k=>`<div class="stack" style="gap:4px"><div class="row between small"><b>${SKILLS[k].name}</b><span class="muted">${S.skills[k]}</span></div><div class="bar"><i style="width:${S.skills[k]}%"></i></div></div>`).join('');
@@ -921,6 +1021,8 @@ function vProgress(){
     const card=(title,desc,start,now,chart,dd=1)=>`<div class="card stack"><div class="row between"><h3>${title}</h3><span class="small muted">${start==null?'\u2013':round(start,dd)} \u2192 <b style="color:var(--ink)">${now==null?'\u2013':round(now,dd)}</b></span></div>${chart}<p class="tiny muted">${desc}</p></div>`;
     const sprints=S.history.filter(h=>h.t==='sprint').slice(-20).map(h=>({y:h.count,label:h.d.slice(5)}));
     body=`<p class="small muted">Each dot is one rep (last 30). The amber dot is your baseline.</p>
+    ${card('Clarity and structure','The biggest part of your score: can a listener follow you and repeat your point? Higher is better.', b.pillars?b.pillars.clarity:null, avg(rec.map(h=>h.clar)), lineChart(withBase(b.pillars?b.pillars.clarity:null,seriesOf('clar')),{label:'Clarity',min:0,max:100}),0)}
+    ${card('Concision','Words spent versus words needed. Rambling, repeating and slow wind-ups pull this down.', b.pillars?b.pillars.concision:null, avg(rec.map(h=>h.conc)), lineChart(withBase(b.pillars?b.pillars.concision:null,seriesOf('conc')),{label:'Concision',min:0,max:100}),0)}
     ${card('Fillers per minute','Lower is better. The green line is this week\u2019s target, which tightens every week.', b.fpm, cur.fpm, lineChart(withBase(b.fpm,seriesOf('fpm')),{target:fillerTarget(wk),label:'Fillers per minute'}))}
     ${card('Words per minute','Aim for the green band, 130 to 170. Too slow loses listeners; too fast loses clarity.', b.wpm, cur.wpm, lineChart(withBase(b.wpm,seriesOf('wpm')),{band:[130,170],label:'Words per minute'}),0)}
     ${card('Word variety','Moving-average type-token ratio. Higher means less repetition and a richer vocabulary.', b.mattr, cur.mattr, lineChart(withBase(b.mattr,seriesOf('mattr')),{fmt:v=>round(v,2),label:'Word variety'}),2)}
@@ -983,6 +1085,7 @@ function vSettings(){
       <p class="small" id="keymsg">${S.settings.apiKey?'Coach is on.':'Coach is off. Metrics and drills work without it.'}</p></div>`}
     <div class="card flat stack small"><b>Your data</b><p class="muted">${store.mode==='cloud'?'Saved privately to your Claude account, so it follows you across devices.':'Saved on this phone, and works offline. Back up now and then so a lost phone doesn\u2019t mean lost progress.'}</p>
       ${store.mode==='cloud'?'':`<div class="row"><button class="btn soft" data-a="export">Back up progress</button><button class="btn ghost" data-a="import">Restore backup</button></div><input type="file" id="importfile" accept="application/json,.json" hidden><p class="tiny muted" id="bkmsg"></p>`}
+      ${S.baseline&&!confirmReset?`<button class="btn soft block" data-a="retake">Retake assessment and restart the regimen</button><p class="tiny muted">Keeps your name, settings, API key and word cards. Clears your score history and starts again at day 1.</p>`:''}
       ${confirmReset?`<button class="btn warn block" data-a="resetconfirm">Erase everything and start over</button><button class="btn ghost block" data-a="resetcancel">Keep my data</button>`:`<button class="btn ghost block" data-a="reset">Reset all progress</button>`}
     </div>
     <button class="btn soft block" data-a="go" data-v="today">Back to today</button>
@@ -1107,7 +1210,8 @@ function coachBlock(){
   const c=RUN.coach; if(!c) return '';
   const sc = c.scores||{};
   return `<div class="card stack"><span class="tag">Coach feedback</span><h3>${esc(c.headline||'')}</h3>
-    <div class="row wrapx">${['structure','clarity','precision','concision','impact'].filter(k=>sc[k]!=null).map(k=>`<span class="pill ${sc[k]>=7?'good':sc[k]<=4?'bad':''}">${k[0].toUpperCase()+k.slice(1)} ${sc[k]}/10</span>`).join('')}</div>
+    <p class="small"><b>Your main point, as a listener heard it:</b> ${c.main_point?esc(c.main_point):'<span style="color:var(--bad)">Couldn\u2019t identify one. That\u2019s the first thing to fix.</span>'}</p>
+    <div class="row wrapx">${COACH_KEYS.filter(k=>sc[k]!=null).map(k=>`<span class="pill ${sc[k]>=7?'good':sc[k]<=4?'bad':''}">${k[0].toUpperCase()+k.slice(1)} ${sc[k]}/10</span>`).join('')}</div>
     ${(c.strengths||[]).length?`<p class="small"><b>What worked:</b> ${(c.strengths||[]).map(esc).join(' ')}</p>`:''}
     ${(c.fixes||[]).map(f=>`<div class="fix stack" style="gap:2px"><b class="small">${esc(f.issue)}</b>${f.you_said?`<span class="small said">${esc(f.you_said)}</span>`:''}<span class="small try">${esc(f.try)}</span></div>`).join('')}
     ${c.rewrite?`<div class="card flat stack"><b class="small">A sharper version</b><p class="small">${esc(c.rewrite)}</p></div>`:''}
@@ -1139,6 +1243,7 @@ function vResults(head){
     ${m.words<12?'<div class="card flat small">Very few words were captured, so this rep is scored lightly. If you did speak, check microphone access or switch to keyboard dictation in settings.</div>':''}
     ${special}
     ${coachBlock()}
+    ${m.pillars&&RUN.coachState!=='loading'?`<details class="card kb"><summary class="small">Why this score</summary>${pillarBars(m.pillars)}</details>`:''}
     <details class="card kb"><summary class="small">All measurements</summary>${metricTiles(m)}<p class="tiny muted" style="margin-top:8px">Transcript: ${esc(last.text||'(empty)')}</p></details>
     ${RUN.coach&&RUN.coach.rewrite&&!RUN.retryResult?`<button class="btn soft block" data-a="rehearse">Rehearse the better version</button>`:''}
     <button class="btn block" data-a="done">Done</button>
@@ -1283,7 +1388,7 @@ function applyResults(){
   RUN.levelMsg = m.words<12 ? '' : success ? (l<10?'Level up: this drill gets harder next time.':'Maximum level held.') : fail ? 'This drill eases off one level so you can build back.' : 'Level held. Hit your filler target and a stronger score to level up.';
   if(it.type==='chunks'){ const n=norm(last.text); const used=it.chunks.filter(c=>n.includes(norm(c).trim())).length; updateSkill('structure', used/it.chunks.length*100); }
   if(coach && Array.isArray(coach.power_words)){ for(const p of coach.power_words.slice(0,3)){ if(p&&p.word&&p.meaning) addCard(`A word for: ${p.meaning}`, `${p.word}${p.example?' \u2014 "'+p.example+'"':''}`, 'coach'); } }
-  S.history.push({d, t:it.type, idx:RUN.index, fpm:m.fpm, wpm:m.wpm, mattr:m.mattr, vague:m.vagueRate, lppm:m.lppm, words:m.words, transcript:last.text.slice(0,500), cs:coach&&coach.scores?coach.scores:null});
+  S.history.push({d, t:it.type, idx:RUN.index, clar:m.pillars?m.pillars.clarity:null, conc:m.pillars?m.pillars.concision:null, fpm:m.fpm, wpm:m.wpm, mattr:m.mattr, vague:m.vagueRate, lppm:m.lppm, words:m.words, transcript:last.text.slice(0,500), cs:coach&&coach.scores?coach.scores:null});
   save();
 }
 function mergeM(a,c){ const o={}; for(const k of ['fpm','wpm','mattr','vagueRate','hedgeRate','lppm','mlr','latency','words']){ const v=avg([a[k],c[k]]); o[k]= v==null?null: (k==='mattr'?round(v,3):k==='wpm'||k==='words'?Math.round(v):round(v,1)); } return o; }
@@ -1295,13 +1400,14 @@ async function finalizeAssess(){
   if(!RUN) return;
   const idx = Math.round(avg([computeIndex(A.m,coach), computeIndex(C.m,coach)]));
   const mm = mergeM(A.m, C.m);
-  const rec = {date:todayStr(), index:idx, fpm:mm.fpm, wpm:mm.wpm, mattr:mm.mattr, vagueRate:mm.vagueRate, hedgeRate:mm.hedgeRate, lppm:mm.lppm, mlr:mm.mlr, latency:mm.latency, sprint:B.count, mA:{...mm, sub:null}, coach};
+  const pA = pillarsOf(A.m, coach), pC = pillarsOf(C.m, coach); const pil = {}; for(const k in PILLAR_W) pil[k]=Math.round(avg([pA[k],pC[k]])); pil.judged = pA.judged;
+  const rec = {date:todayStr(), index:idx, pillars:pil, fpm:mm.fpm, wpm:mm.wpm, mattr:mm.mattr, vagueRate:mm.vagueRate, hedgeRate:mm.hedgeRate, lppm:mm.lppm, mlr:mm.mlr, latency:mm.latency, sprint:B.count, mA:{...mm, sub:null}, coach};
   if(RUN.kind==='assess'){
     const sa=A.m.sub, sc=C.m.sub; const cs=coach&&coach.scores;
     const sk = {
       fluency: avg([sa.fluency, sc.fluency]), retrieval: avg([avg([sa.lexical,sc.lexical]), clamp(B.count/20*100)]),
-      structure: cs?cs.structure*10:null, precision: avg([avg([sa.vague,sc.vague]), cs?cs.precision*10:null]),
-      concision: cs?cs.concision*10:null, delivery: avg([sa.rate,sc.rate,sa.pause,sc.pause]), composure: avg([avg([sa.hedge,sc.hedge]), 100-S.profile.anxiety*8])
+      structure: cs?avg([cs.structure*10, cs.coherence!=null?cs.coherence*10:null]):avg([sa.clarityH, sc.clarityH]), precision: avg([avg([sa.vague,sc.vague]), cs?cs.precision*10:null]),
+      concision: cs?cs.concision*10:avg([sa.concisionH, sc.concisionH]), delivery: avg([sa.rate,sc.rate,sa.pause,sc.pause]), composure: avg([avg([sa.hedge,sc.hedge]), 100-S.profile.anxiety*8])
     };
     for(const k in sk) sk[k] = sk[k]==null ? 50 : Math.round(clamp(sk[k]));
     S.skills = sk; S.baseSkills = {...sk}; S.baseline = rec;
@@ -1359,6 +1465,7 @@ const A = {
   setctx(v){ const c=S.profile.contexts; S.profile.contexts = c.includes(v)?c.filter(x=>x!==v):[...c,v]; save(); render(); },
   reset(){ confirmReset=true; render(); },
   resetcancel(){ confirmReset=false; render(); },
+  retake(){ S.baseline=null; S.baseSkills=null; S.skills=null; S.levels={}; S.history=[]; S.checkpoints=[]; S.days={}; S.completed=0; S.streak=0; S.lastDone=null; S.doneDates=[]; save(); view='today'; render(); window.scrollTo(0,0); },
   resetconfirm(){ const keep=S.settings; S=freshState(); S.settings=keep; confirmReset=false; OB={name:'', contexts:['work'], minutes:15, anxiety:5, goal:''}; save(); view='onboard'; render(); window.scrollTo(0,0); }
 };
 document.addEventListener('click', e=>{ const el=e.target.closest('[data-a]'); if(!el || el.disabled) return; const f=A[el.dataset.a]; if(f){ e.preventDefault(); f(el.dataset.v, el); } });
